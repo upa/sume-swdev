@@ -351,14 +351,14 @@ struct sume_port {
 
 /* for reference_router switchdev API */
 
-#define SUME_PORT_ARP_TABLE_SIZE	32
-#define SUME_PORT_IP_TABLE_SIZE		32
+#define SUME_ROUTER_ARP_SIZE	32
+#define SUME_ROUTER_FIB4_SIZE	32
 
 struct sume_router {
 
 	/* XXX:
-	 * routing table and arp table of reference_nic corresponds to
-	 * a "card", not "port". So, struct sume_router represents
+	 * routing table and arp table of reference_router corresponds
+	 * to a "card", not "port". So, struct sume_router represents
 	 * NetFPGA-SUME card itself. In order to add an arp entry or a
 	 * routing entry, acquiring lock of sume_router and verifying
 	 * that the entry does not exist in the card are needed.
@@ -366,23 +366,33 @@ struct sume_router {
 
 	rwlock_t	lock;
 
-	struct sume_arp_table {
+	struct sume_router_arp {
+		__u8		index;		/* table index */
 		__be32		addr;
 		unsigned char	mac[ETH_ALEN];
 		__u8		nud_state;
-	} arp_table[SUME_PORT_ARP_TABLE_SIZE];
+		unsigned long	updated;	/* jiffies */
+	} arp_table[SUME_ROUTER_ARP_SIZE];
 
-	struct sume_ip_table {
-		__be32	network;
-		__be32	netmask;
-		__be32	gateway;
-	} ip_table[32];
+	struct sume_router_fib4 {
+		__u8		index;		/* table index */
+		__be32		network;
+		__be32		netmask;
+		__be32		gateway;
+		unsigned long	updated;	/* jiffies */
+	} fib4_table[SUME_ROUTER_FIB4_SIZE];
 };
+
+#define sume_router_lock() write_lock_bh(&sume_router.lock)
+#define sume_router_unlock() write_unlock_bh(&sume_router.lock)
 
 static struct sume_router sume_router;
 
-#define sume_router_lock(x) write_lock_bh(&(x).lock)
-#define sume_router_unlock(x) write_unlock_bh(&(x).lock)
+enum {
+	SUME_ROUTER_OP_FLAG_UNUSED,
+	SUME_ROUTER_OP_FLAG_INSTALL,
+	SUME_ROUTER_OP_FLAG_REMOVE,
+};
 
 static void init_sume_router(struct sume_router *sume_router)
 {
@@ -974,19 +984,113 @@ static const struct net_device_ops sume_netdev_ops = {
 
 
 /* SWITCHDEV for SUME reference_router project: 
- * add or delete IPv4 route to SUME. This route operation is for
- * reference_router project. To add or delete route etnries, we use
- * switchdev API. see kernel/Documentation/networking/switchdev.txt.
+ * Sync IPv4 routing table of kernel with SUME card. This route
+ * operation is for reference_router project. To add or delete route
+ * etnries, we use switchdev API. see
+ * kernel/Documentation/networking/switchdev.txt.
  */
+
+static struct sume_router_arp * sume_router_arp_candidate(void)
+{
+	int n;
+	unsigned long time = jiffies;
+	struct sume_router_arp *arp = NULL;
+
+	/* return an arp table entry for a new arp entry. */
+
+	/* 1. find not used arp entry */
+	for (n = 0; n < SUME_ROUTER_ARP_SIZE; n++) {
+		if (sume_router.arp_table[n].addr == 0) {
+			sume_router.arp_table[n].index = n;
+			return &sume_router.arp_table[n];
+		}
+	}
+
+	/* 2. find oldest arp entry */
+	for (n = 0; n < SUME_ROUTER_ARP_SIZE; n++) {
+		if (time_before_eq(sume_router.arp_table[n].updated, time)) {
+			arp = &sume_router.arp_table[n];
+			time = arp->updated;
+		}
+	}
+
+	return arp;
+}
+
+static struct sume_router_arp * sume_router_arp_find(struct neighbour *n)
+{
+	int i;
+	__be32 addr;
+	struct sume_router_arp *arp;
+
+	for (i = 0; i < SUME_ROUTER_ARP_SIZE; i++) {
+
+		arp = &sume_router.arp_table[i];
+		addr = *(__be32 *)n->primary_key;
+
+		if (addr == arp->addr &&
+		    arp->mac[0] == n->ha[0] && arp->mac[1] == n->ha[1] &&
+		    arp->mac[2] == n->ha[2] && arp->mac[3] == n->ha[3] &&
+		    arp->mac[4] == n->ha[4] && arp->mac[5] == n->ha[6]) {
+			return arp;
+		}
+	}
+
+	return NULL;
+}
+
+static int sume_router_neigh_add(struct net_device *dev,
+				 struct sume_router_arp *arp)
+{
+	/* write arp entry to SUME card via register */
+	return 0;
+}
+
+static int sume_router_neigh_del(struct net_device *dev,
+				 struct sume_router_arp *arp)
+{
+	/* write arp entry to del SUME card via register */
+	return 0;
+}
 
 static void sume_router_neigh_update(struct net_device *dev,
 				     struct neighbour *n)
 {
-	/* TODO:
-	 * write a neighbor entry to the sume device *dev.
-	 * before install, check sume_router.arp_table.
-	 */
+	struct sume_router_arp *arp;
+	bool adding = (n->nud_state & NUD_VALID);
+
+	sume_router_lock();
 	
+	arp = sume_router_arp_find(n);
+
+	if (!adding) {
+		/* remove this neighbour entry! */
+		if (!arp)
+			goto end;
+
+		sume_router_neigh_del(dev, arp);
+		goto end;
+	}
+
+	if (adding) {
+		/* update or add new entry! */
+		if (arp) {
+			arp->updated = jiffies;
+			goto end;
+		}
+
+		arp = sume_router_arp_candidate();
+		arp->addr = *(__be32 *)n->primary_key;
+		arp->updated = jiffies;
+		arp->nud_state = n->nud_state;
+		memcpy(arp->mac, n->ha, ETH_ALEN);
+
+		sume_router_neigh_add(dev, arp);
+	}
+
+end:
+	sume_router_unlock();
+
 	return;
 }
 
@@ -1011,16 +1115,99 @@ static int sume_router_neigh_resolve(struct net_device *dev, __be32 addr)
 	return 0;
 }
 
-static int
-sume_router_fib4_add(struct net_device *dev, __be32 network, __be32 netmask,
-		     __be32 gateway)
+static struct sume_router_fib4 * sume_router_fib4_candidate(void)
 {
-	/* TODO:
-	 * write ipv4 route entry to the card.
-	 */
+	int n;
+	unsigned long time = jiffies;
+	struct sume_router_fib4 *fib4 = NULL;
 
+	/* return an fib4 table entry for a new fib4 entry. */
+
+	/* 1. find not used fib4 entry */
+	for (n = 0; n < SUME_ROUTER_FIB4_SIZE; n++) {
+		if (sume_router.fib4_table[n].gateway == 0) {
+			sume_router.fib4_table[n].index = n;
+			return &sume_router.fib4_table[n];
+		}
+	}
+
+	/* 2. find oldest fib4 entry */
+	for (n = 0; n < SUME_ROUTER_FIB4_SIZE; n++) {
+		if (time_before_eq(sume_router.fib4_table[n].updated, time)) {
+			fib4 = &sume_router.fib4_table[n];
+			time = fib4->updated;
+		}
+	}
+
+	return fib4;
+}
+
+static struct sume_router_fib4 * sume_router_fib4_find(__be32 network,
+						       __be32 netmask)
+{
+	int n;
+	struct sume_router_fib4 *fib4;
+
+	for (n = 0; n < SUME_ROUTER_FIB4_SIZE; n++) {
+		fib4 = &sume_router.fib4_table[n];
+
+		if (fib4->network == network && fib4->netmask == netmask)
+			return fib4;
+	}
+
+	return NULL;
+}
+
+static int sume_router_fib4_add(struct net_device *dev,
+				struct sume_router_fib4 *fib4)
+{
 	return 0;
 }
+
+static int sume_router_fib4_del(struct net_device *dev,
+				struct sume_router_fib4 *fib4)
+{
+	return 0;
+}
+
+static int
+sume_router_fib4_update(struct net_device *dev, __be32 network,
+			__be32 netmask, __be32 gateway, int flag)
+{
+	int err = 0;
+	bool adding = (flag == SUME_ROUTER_OP_FLAG_INSTALL);
+	struct sume_router_fib4 *fib4;
+
+	sume_router_lock();
+
+	fib4 = sume_router_fib4_find(network, netmask);
+
+	if (!adding) {
+		/* remove existing route entry! */
+		if (!fib4)
+			goto end;
+		err = sume_router_fib4_del(dev, fib4);
+	}
+
+	if (adding) {
+		/* update or add new entry */
+		if (!fib4)
+			fib4 = sume_router_fib4_candidate();
+
+		fib4->network = network;
+		fib4->netmask = netmask;
+		fib4->gateway = gateway;
+		fib4->updated = jiffies;
+
+		err = sume_router_fib4_add(dev, fib4);
+	}
+
+end:
+	sume_router_unlock();
+
+	return err;
+}
+
 
 static int sume_router_obj_fib4_add(struct net_device *dev,
 				    const struct switchdev_obj_ipv4_fib *fib4)
@@ -1038,8 +1225,9 @@ static int sume_router_obj_fib4_add(struct net_device *dev,
 		return 0;
 	}
 
-	sume_router_fib4_add(dev, network, netmask, gateway);
 	sume_router_neigh_resolve(dev, gateway);
+	sume_router_fib4_update(dev, network, netmask, gateway,
+				SUME_ROUTER_OP_FLAG_INSTALL);
 
 	return 0;
 }
@@ -1048,7 +1236,14 @@ static int
 sume_router_obj_fib4_del(struct net_device *dev,
 			 const struct switchdev_obj_ipv4_fib *fib4)
 {
-	/* XXX: implement this ! */
+	__be32 network, netmask, gateway;
+
+	network = htonl (fib4->dst);
+	netmask = inet_make_mask(fib4->dst_len);
+	gateway = fib4->fi.fib_nh->nh_gw;
+
+	sume_router_fib4_update(dev, network, netmask, gateway,
+				SUME_ROUTER_OP_FLAG_REMOVE);
 
 	return 0;
 }
