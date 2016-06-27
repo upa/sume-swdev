@@ -80,6 +80,10 @@
 #include <net/neighbour.h>
 #include <net/netevent.h>
 #include <linux/inetdevice.h>
+#include "reg_defines.h"
+
+#define WRITE_CMD	0x01
+
 
 #include "nf_sume.h"
 
@@ -1039,18 +1043,66 @@ static struct sume_router_arp * sume_router_arp_find(struct neighbour *n)
 	return NULL;
 }
 
-static int sume_router_neigh_add(struct net_device *dev,
+static void sume_router_neigh_add(struct net_device *dev,
 				 struct sume_router_arp *arp)
 {
+	u32 t_addr, cmd;
+	unsigned long flags;
+	struct sume_port *sume_port = netdev_priv(dev);
+	struct sume_adapter *adapter = sume_port->adapter;
+
 	/* write arp entry to SUME card via register */
-	return 0;
+
+	SUME_LOCK(adapter, flags);
+
+	/* DMA IP address */
+	write_reg(adapter,
+		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW,
+		  arp->addr);
+
+	/* DMA MAC Address */
+	write_reg(adapter,
+		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_HI,
+		  arp->mac[0] << 8 | arp->mac[1]);
+	write_reg(adapter,
+		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW,
+		  arp->mac[2] << 24 | arp->mac[3] << 16 |
+		  arp->mac[4] << 8 | arp->mac[5]);
+
+	/* DMA change notify */
+	cmd = WRITE_CMD;
+	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_MEM_IP_ARP_CAM_ADDRESS | arp->index;
+
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
+
+	SUME_UNLOCK(adapter, flags);
+
+	return;
 }
 
-static int sume_router_neigh_del(struct net_device *dev,
+static void sume_router_neigh_del(struct net_device *dev,
 				 struct sume_router_arp *arp)
 {
+	u32 t_addr, cmd;
+	unsigned long flags;
+	struct sume_port *sume_port = netdev_priv(dev);
+	struct sume_adapter *adapter = sume_port->adapter;
+
 	/* write arp entry to del SUME card via register */
-	return 0;
+
+	SUME_LOCK(adapter, flags);
+
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW, 0);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_HI, 0);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW, 0);
+
+	cmd = WRITE_CMD;
+	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_MEM_IP_ARP_CAM_ADDRESS | arp->index;
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
+
+	return;
 }
 
 static void sume_router_neigh_update(struct net_device *dev,
@@ -1158,16 +1210,63 @@ static struct sume_router_fib4 * sume_router_fib4_find(__be32 network,
 	return NULL;
 }
 
-static int sume_router_fib4_add(struct net_device *dev,
+static void sume_router_fib4_add(struct net_device *dev,
 				struct sume_router_fib4 *fib4)
 {
-	return 0;
+	u32 t_addr, cmd;
+	unsigned long flags;
+	struct sume_port *sume_port = netdev_priv(dev);
+	struct sume_adapter *adapter = sume_port->adapter;
+
+	SUME_LOCK(adapter, flags);
+
+	/* DMA fib entry */
+	write_reg(adapter,
+		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_HI,
+		  fib4->network);
+	write_reg(adapter,
+		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_HI,
+		  fib4->netmask);
+	write_reg(adapter,
+		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW,
+		  fib4->gateway);
+	write_reg(adapter,SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW,
+		  sume_port->port);
+
+	/* DMA change notify */
+	cmd = WRITE_CMD;
+	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS | fib4->index;
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
+
+	SUME_UNLOCK(adapter, flags);
+
+	return;
 }
 
-static int sume_router_fib4_del(struct net_device *dev,
-				struct sume_router_fib4 *fib4)
+static void sume_router_fib4_del(struct net_device *dev,
+				 struct sume_router_fib4 *fib4)
 {
-	return 0;
+	u32 t_addr, cmd;
+	unsigned long flags;
+	struct sume_port *sume_port = netdev_priv(dev);
+	struct sume_adapter *adapter = sume_port->adapter;
+
+	SUME_LOCK(adapter, flags);
+
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_HI, 0);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_HI, 0);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW, 0);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW, 0);
+
+	cmd = WRITE_CMD;
+	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS | fib4->index;
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
+
+	SUME_UNLOCK(adapter, flags);
+
+	return;
 }
 
 static int
@@ -1184,9 +1283,11 @@ sume_router_fib4_update(struct net_device *dev, __be32 network,
 
 	if (!adding) {
 		/* remove existing route entry! */
-		if (!fib4)
+		if (!fib4) {
+			err = -ENOENT;
 			goto end;
-		err = sume_router_fib4_del(dev, fib4);
+		}
+		sume_router_fib4_del(dev, fib4);
 	}
 
 	if (adding) {
@@ -1199,7 +1300,7 @@ sume_router_fib4_update(struct net_device *dev, __be32 network,
 		fib4->gateway = gateway;
 		fib4->updated = jiffies;
 
-		err = sume_router_fib4_add(dev, fib4);
+		sume_router_fib4_add(dev, fib4);
 	}
 
 end:
