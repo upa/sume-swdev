@@ -1278,7 +1278,7 @@ static void sume_router_fib4_add(struct net_device *dev,
 	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW,
 		 ntohl(fib4->gateway));
 	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW,
-		 sume_port->port);
+		 1 << (sume_port->port * 2));
 
 	/* DMA change notify */
 	cmd = WRITE_CMD;
@@ -1375,6 +1375,12 @@ end:
 	return err;
 }
 
+static int
+sume_router_filter_update(struct net_device *dev, __be32 network,
+			  __be32 netmask, int flag)
+{
+	return 0;
+}
 
 static int sume_router_obj_fib4_add(struct net_device *dev,
 				    struct switchdev_obj *obj)
@@ -1386,16 +1392,24 @@ static int sume_router_obj_fib4_add(struct net_device *dev,
 	netmask = inet_make_mask(fib4->dst_len);
 	gateway = fib4->fi->fib_nh->nh_gw;
 
-	if (fib4->fi->fib_scope == RT_SCOPE_LINK ||
-	    fib4->fi->fib_scope == RT_SCOPE_HOST) {
+	if (fib4->fi->fib_scope == RT_SCOPE_LINK) {
 		/* XXX:
 		 * This is connected route. how to handle it ?
 		 */
-		pr_debug("%s: %pI4, %pI4 is connected route.\n",
-			 __func__, &network, &netmask);
+		pr_info("%s: %pI4, %pI4 is connected route (%d),\n",
+			__func__, &network, &netmask, fib4->fi->fib_scope);
 
 		if (switchdev_trans_ph_prepare(obj))
 			return -EOPNOTSUPP;
+	}
+
+	if (fib->fi->fib_scope == RT_SCOPE_HOST) {
+		/* self host route. update dst addr filter of sume. */
+		if (switchdev_trans_ph_prepare(obj))
+			return 0;
+		sume_router_filter_update(dev, entwork, netmask, gateway,
+					  SUME_ROUTER_OP_FLAG_ISNTALL);
+		return 0;
 	}
 
 	if (switchdev_trans_ph_prepare(obj))
