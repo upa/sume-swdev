@@ -79,6 +79,7 @@
 #include <net/arp.h>
 #include <net/neighbour.h>
 #include <net/netevent.h>
+#include <net/ip_fib.h>
 #include <linux/inetdevice.h>
 #include "reg_defines.h"
 
@@ -994,6 +995,13 @@ static const struct net_device_ops sume_netdev_ops = {
  * kernel/Documentation/networking/switchdev.txt.
  */
 
+static int switchdev_trans_ph_prepare(struct switchdev_obj *obj)
+{
+	if (obj->trans == SWITCHDEV_TRANS_PREPARE)
+		return 1;
+	return 0;
+}
+
 static struct sume_router_arp * sume_router_arp_candidate(void)
 {
 	int n;
@@ -1053,6 +1061,12 @@ static void sume_router_neigh_add(struct net_device *dev,
 
 	/* write arp entry to SUME card via register */
 
+	pr_info("%s: ip %pI4, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+		__func__, &arp->addr,
+		arp->mac[0], arp->mac[1], arp->mac[2],
+		arp->mac[3], arp->mac[4], arp->mac[5]);
+	return;
+
 	SUME_LOCK(adapter, flags);
 
 	/* DMA IP address */
@@ -1090,6 +1104,12 @@ static void sume_router_neigh_del(struct net_device *dev,
 	struct sume_adapter *adapter = sume_port->adapter;
 
 	/* write arp entry to del SUME card via register */
+
+	pr_info("%s: ip %pI4, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+		__func__, &arp->addr,
+		arp->mac[0], arp->mac[1], arp->mac[2],
+		arp->mac[3], arp->mac[4], arp->mac[5]);
+	return;
 
 	SUME_LOCK(adapter, flags);
 
@@ -1218,6 +1238,10 @@ static void sume_router_fib4_add(struct net_device *dev,
 	struct sume_port *sume_port = netdev_priv(dev);
 	struct sume_adapter *adapter = sume_port->adapter;
 
+	pr_info ("%s: network %pI4, netmask %pI4, gateway %pI4",
+		 __func__, &fib4->network, &fib4->netmask, &fib4->gateway);
+	return;
+
 	SUME_LOCK(adapter, flags);
 
 	/* DMA fib entry */
@@ -1251,6 +1275,10 @@ static void sume_router_fib4_del(struct net_device *dev,
 	unsigned long flags;
 	struct sume_port *sume_port = netdev_priv(dev);
 	struct sume_adapter *adapter = sume_port->adapter;
+
+	pr_info ("%s: network %pI4, netmask %pI4, gateway %pI4",
+		 __func__, &fib4->network, &fib4->netmask, &fib4->gateway);
+	return;
 
 	SUME_LOCK(adapter, flags);
 
@@ -1311,20 +1339,29 @@ end:
 
 
 static int sume_router_obj_fib4_add(struct net_device *dev,
-				    const struct switchdev_obj_ipv4_fib *fib4)
+				    struct switchdev_obj *obj)
 {
 	__be32 network, netmask, gateway;
+	struct switchdev_obj_ipv4_fib *fib4 = &obj->u.ipv4_fib;
 
 	network = htonl (fib4->dst);
 	netmask = inet_make_mask(fib4->dst_len);
-	gateway = fib4->fi.fib_nh->nh_gw;
+	gateway = fib4->fi->fib_nh->nh_gw;
 
-	if (fib4->fi.fib_scope == RT_SCOPE_LINK) {
+	if (fib4->fi->fib_scope == RT_SCOPE_LINK ||
+	    fib4->fi->fib_scope == RT_SCOPE_HOST) {
 		/* XXX:
 		 * This is connected route. how to handle it ?
 		 */
-		return 0;
+		pr_debug("%s: %pI4, %pI4 is connected route.\n",
+			 __func__, &network, &netmask);
+
+		if (switchdev_trans_ph_prepare(obj))
+			return -EOPNOTSUPP;
 	}
+
+	if (switchdev_trans_ph_prepare(obj))
+		return 0;
 
 	sume_router_neigh_resolve(dev, gateway);
 	sume_router_fib4_update(dev, network, netmask, gateway,
@@ -1334,14 +1371,14 @@ static int sume_router_obj_fib4_add(struct net_device *dev,
 }
 
 static int
-sume_router_obj_fib4_del(struct net_device *dev,
-			 const struct switchdev_obj_ipv4_fib *fib4)
+sume_router_obj_fib4_del(struct net_device *dev, struct switchdev_obj *obj)
 {
 	__be32 network, netmask, gateway;
+	struct switchdev_obj_ipv4_fib *fib4 = &obj->u.ipv4_fib;
 
 	network = htonl (fib4->dst);
 	netmask = inet_make_mask(fib4->dst_len);
-	gateway = fib4->fi.fib_nh->nh_gw;
+	gateway = fib4->fi->fib_nh->nh_gw;
 
 	sume_router_fib4_update(dev, network, netmask, gateway,
 				SUME_ROUTER_OP_FLAG_REMOVE);
@@ -1356,7 +1393,7 @@ static int sume_router_attr_get(struct net_device *dev,
 				struct switchdev_attr *attr)
 {
 	switch (attr->id) {
-	case SWITCHDEV_ATTR_ID_PORT_PARENT_ID:
+	case SWITCHDEV_ATTR_PORT_PARENT_ID:
 		/* XXX:
 		 * PARENT_ID is needed for switchdev_get_dev_by_nhs(),
 		 * called by switchdev_fib_ipv4_add(). So we use MAC addr
@@ -1373,25 +1410,19 @@ static int sume_router_attr_get(struct net_device *dev,
 }
 
 static int sume_router_attr_set(struct net_device *dev,
-				const struct switchdev_attr *attr,
-				struct switchdev_trans *trans)
+				struct switchdev_attr *attr)
 {
 	return -ENOTSUPP;
 }
 
 static int sume_router_obj_add(struct net_device *dev,
-			       const struct switchdev_obj *obj,
-			       struct switchdev_trans *trans)
+			       struct switchdev_obj *obj)
 {
 	int err = 0;
 
-	if (switchdev_trans_ph_prepare(trans))
-		return 0;
-
 	switch (obj->id) {
-	case SWITCHDEV_OBJ_ID_IPV4_FIB:
-		err = sume_router_obj_fib4_add(dev,
-					       SWITCHDEV_OBJ_IPV4_FIB(obj));
+	case SWITCHDEV_OBJ_IPV4_FIB:
+		err = sume_router_obj_fib4_add(dev, obj);
 		break;
 	default:
 		err = -EOPNOTSUPP;
@@ -1401,15 +1432,14 @@ static int sume_router_obj_add(struct net_device *dev,
 }
 
 static int sume_router_obj_del(struct net_device *dev,
-			     const struct switchdev_obj *obj)
+			       struct switchdev_obj *obj)
 
 {
 	int err = 0;
 
 	switch (obj->id) {
-	case SWITCHDEV_OBJ_ID_IPV4_FIB:
-		err = sume_router_obj_fib4_del(dev,
-					       SWITCHDEV_OBJ_IPV4_FIB(obj));
+	case SWITCHDEV_OBJ_IPV4_FIB:
+		err = sume_router_obj_fib4_del(dev, obj);
 		break;
 	default:
 		err = -EOPNOTSUPP;
