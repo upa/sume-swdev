@@ -370,6 +370,7 @@ struct sume_router {
 	 */
 
 	rwlock_t	lock;
+	struct workqueue_struct *wq;
 
 	struct sume_router_arp {
 		__u8		index;		/* table index */
@@ -377,6 +378,8 @@ struct sume_router {
 		unsigned char	mac[ETH_ALEN];
 		__u8		nud_state;
 		unsigned long	updated;	/* jiffies */
+		struct net_device 	*dev;
+		struct work_struct	work;	/* delayed write reg */
 	} arp_table[SUME_ROUTER_ARP_SIZE];
 
 	struct sume_router_fib4 {
@@ -399,10 +402,21 @@ enum {
 	SUME_ROUTER_OP_FLAG_REMOVE,
 };
 
-static void init_sume_router(struct sume_router *sume_router)
+static int init_sume_router(struct sume_router *sume_router)
 {
 	memset(sume_router, 0, sizeof(struct sume_router));
 	rwlock_init(&sume_router->lock);
+	sume_router->wq = alloc_workqueue("sume-router-work", 0, 0);
+	if (!sume_router->wq) {
+		pr_err("failed to allocate work queue for sume router\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static void destroy_sume_router(struct sume_router *sume_router)
+{
+	destroy_workqueue(sume_router->wq);
 }
 
 
@@ -995,6 +1009,14 @@ static const struct net_device_ops sume_netdev_ops = {
  * kernel/Documentation/networking/switchdev.txt.
  */
 
+/* sume reference_router write register */
+static int sr_write(struct net_device *dev, u32 addr, u32 val)
+{
+	struct sume_port *sume_port = netdev_priv(dev);
+	struct sume_ifreq sifr = { addr = addr, val = val };
+	return sume_initiate_reg_write(sume_port, &sifr, 0x1f);
+}
+
 static int switchdev_trans_ph_prepare(struct switchdev_obj *obj)
 {
 	if (obj->trans == SWITCHDEV_TRANS_PREPARE)
@@ -1055,44 +1077,41 @@ static void sume_router_neigh_add(struct net_device *dev,
 				 struct sume_router_arp *arp)
 {
 	u32 t_addr, cmd;
-	unsigned long flags;
-	struct sume_port *sume_port = netdev_priv(dev);
-	struct sume_adapter *adapter = sume_port->adapter;
 
 	/* write arp entry to SUME card via register */
 
-	pr_info("%s: ip %pI4, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
-		__func__, &arp->addr,
+	pr_info("%s: index %d, ip %pI4, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+		__func__, arp->index, &arp->addr,
 		arp->mac[0], arp->mac[1], arp->mac[2],
 		arp->mac[3], arp->mac[4], arp->mac[5]);
-	return;
-
-	SUME_LOCK(adapter, flags);
 
 	/* DMA IP address */
-	write_reg(adapter,
-		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW,
-		  arp->addr);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW,
+		 ntohl (arp->addr));
 
 	/* DMA MAC Address */
-	write_reg(adapter,
-		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_HI,
-		  arp->mac[0] << 8 | arp->mac[1]);
-	write_reg(adapter,
-		  SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW,
-		  arp->mac[2] << 24 | arp->mac[3] << 16 |
-		  arp->mac[4] << 8 | arp->mac[5]);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_HI,
+		 arp->mac[0] << 8 | arp->mac[1]);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_A_LOW,
+		 arp->mac[2] << 24 | arp->mac[3] << 16 |
+		 arp->mac[4] << 8 | arp->mac[5]);
 
 	/* DMA change notify */
 	cmd = WRITE_CMD;
 	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_MEM_IP_ARP_CAM_ADDRESS | arp->index;
 
-	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
-	write_reg(adapter, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
-
-	SUME_UNLOCK(adapter, flags);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
 
 	return;
+}
+
+static void sume_router_neigh_add_work(struct work_struct *work)
+{
+	struct sume_router_arp *arp;
+
+	arp = container_of(work, struct sume_router_arp, work);
+	sume_router_neigh_add(arp->dev, arp);
 }
 
 static void sume_router_neigh_del(struct net_device *dev,
@@ -1105,8 +1124,8 @@ static void sume_router_neigh_del(struct net_device *dev,
 
 	/* write arp entry to del SUME card via register */
 
-	pr_info("%s: ip %pI4, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
-		__func__, &arp->addr,
+	pr_info("%s: index %d, ip %pI4, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+		__func__, arp->index, &arp->addr,
 		arp->mac[0], arp->mac[1], arp->mac[2],
 		arp->mac[3], arp->mac[4], arp->mac[5]);
 	return;
@@ -1155,9 +1174,10 @@ static void sume_router_neigh_update(struct net_device *dev,
 		arp->addr = *(__be32 *)n->primary_key;
 		arp->updated = jiffies;
 		arp->nud_state = n->nud_state;
+		arp->dev = dev;
 		memcpy(arp->mac, n->ha, ETH_ALEN);
-
-		sume_router_neigh_add(dev, arp);
+		INIT_WORK(&arp->work, sume_router_neigh_add_work);
+		queue_work(sume_router.wq, &arp->work);
 	}
 
 end:
@@ -2466,7 +2486,10 @@ sume_init_module(void)
 		return error;
 	}
 
-	init_sume_router(&sume_router);
+	error = init_sume_router(&sume_router);
+	if (error != 0)
+		return error;
+
 	register_netevent_notifier(&sume_router_netevent_nb);
 
 	return (error);
@@ -2478,6 +2501,7 @@ sume_init_module(void)
 static void __exit
 sume_exit_module(void)
 {
+	destroy_sume_router(&sume_router);
 
 	/* Tell the PCI subsystem we are going away. */
 	pci_unregister_driver(&sume_driver);
