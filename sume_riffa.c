@@ -358,6 +358,7 @@ struct sume_port {
 
 #define SUME_ROUTER_ARP_SIZE	32
 #define SUME_ROUTER_FIB4_SIZE	32
+#define SUME_ROUTER_DST4_SIZE	32
 
 struct sume_router {
 
@@ -391,6 +392,14 @@ struct sume_router {
 		struct net_device	*dev;
 		struct work_struct	work;	/* delayed write reg */
 	} fib4_table[SUME_ROUTER_FIB4_SIZE];
+
+	struct sume_router_dst4 {
+		__u8		index;		/* table index */
+		__be32		network;
+		unsigned long	updated;	/* jiffies */
+		struct net_device	*dev;
+		struct work_struct	work;	/* delayed write reg */
+	} dst4_table[SUME_ROUTER_FIB4_SIZE];
 };
 
 #define sume_router_lock() write_lock_bh(&sume_router.lock)
@@ -499,6 +508,8 @@ sume_open(struct net_device *netdev)
 	netif_start_queue(netdev);
 
 	netif_info(sume_port, ifup, netdev, "up\n");
+
+	sume_router_set_port_mac(netdev);
 
 	return (0);
 }
@@ -1020,8 +1031,10 @@ static const struct net_device_ops sume_netdev_ops = {
 /* sume reference_router write register */
 static int sr_write(struct net_device *dev, u32 addr, u32 val)
 {
-	struct sume_port *sume_port = netdev_priv(dev);
+	struct sume_port *sume_port;
 	struct sume_ifreq sifr = { addr = addr, val = val };
+
+	sume_port = netdev_priv(dev);
 	return sume_initiate_reg_write(sume_port, &sifr, 0x1f);
 }
 
@@ -1375,10 +1388,139 @@ end:
 	return err;
 }
 
-static int
-sume_router_filter_update(struct net_device *dev, __be32 network,
-			  __be32 netmask, int flag)
+static struct sume_router_dst4 * sume_router_dst4_candidate(void)
 {
+	int n;
+	unsigned long time = jiffies;
+	struct sume_router_dst4 *dst4 = NULL;
+
+	/* 1. find not used dst4 entry */
+	for (n = 0; n < SUME_ROUTER_DST4_SIZE; n++) {
+		if (sume_router.dst4_table[n].network == 0) {
+			sume_router.dst4_table[n].index = n;
+			return &sume_router.dst4_table[n];
+		}
+	}
+
+	/* 2. find oldest dst4 entry */
+	for (n = 0; n < SUME_ROUTER_DST4_SIZE; n++) {
+		if (time_before_eq(sume_router.dst4_table[n].updated, time)) {
+			dst4 = &sume_router.dst4_table[n];
+			time = dst4->updated;
+		}
+	}
+
+	return dst4;
+}
+
+static struct sume_router_dst4 * sume_router_dst4_find(__be32 network)
+{
+	int n;
+	struct sume_router_dst4 *dst4;
+
+	for (n = 0; n < SUME_ROUTER_DST4_SIZE; n++) {
+		dst4 = &sume_router.dst4_table[n];
+
+		if (dst4->network == network)
+			return dst4;
+	}
+
+	return NULL;
+}
+
+static void sume_router_dst4_add(struct net_device *dev,
+				 struct sume_router_dst4 *dst4)
+{
+	u32 t_addr, cmd;
+
+	pr_info("%s: network %pI4 dev %s\n", __func__,
+		&dst4->network, dst4->dev->name);
+
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW,
+		 htonl(dst4->network));
+
+	cmd = WRITE_CMD;
+	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_MEM_DEST_IP_CAM_ADDRESS |
+		dst4->index;
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
+}
+
+static void sume_router_dst4_add_work(struct work_struct *work)
+{
+	struct sume_router_dst4 *dst4;
+
+	dst4 = container_of(work, struct sume_router_dst4, work);
+	sume_router_dst4_add(dst4->dev, dst4);
+}
+
+static void sume_router_dst4_del(struct net_device *dev,
+				 struct sume_router_dst4 *dst4)
+{
+	u32 t_addr, cmd;
+
+	pr_info("%s: network %pI4 dev %s\n", __func__,
+		&dst4->network, dst4->dev->name);
+
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTWRDATA_B_LOW, 0);
+
+	cmd = WRITE_CMD;
+	t_addr = SUME_OUTPUT_PORT_LOOKUP_0_MEM_DEST_IP_CAM_ADDRESS |
+		dst4->index;
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTADDRESS, t_addr);
+	sr_write(dev, SUME_OUTPUT_PORT_LOOKUP_0_INDIRECTCOMMAND, cmd);
+}
+
+static void sume_router_dst4_del_work(struct work_struct *work)
+{
+	struct sume_router_dst4 *dst4;
+
+	dst4 = container_of(work, struct sume_router_dst4, work);
+	sume_router_dst4_del(dst4->dev, dst4);
+
+	dst4->network = 0;
+	dst4->dev = NULL;
+}
+
+static int
+sume_router_filter_update(struct net_device *dev, __be32 network, int flag)
+{
+	int err = 0;
+	bool adding = (flag == SUME_ROUTER_OP_FLAG_INSTALL);
+	struct sume_router_dst4 *dst4;
+
+	sume_router_lock();
+
+	dst4 = sume_router_dst4_find(network);
+
+	if (!adding) {
+		/* remove existing dst filter entry */
+		if (dst4) {
+			err = -ENOENT;
+			goto end;
+		}
+		INIT_WORK(&dst4->work, sume_router_dst4_del_work);
+		queue_work(sume_router.wq, &dst4->work);
+	}
+
+	if (adding) {
+		/* add new filter entry */
+		if (dst4) {
+			dst4->updated = jiffies;
+			goto end;
+		}
+
+		dst4 = sume_router_dst4_candidate();
+		dst4->network = network;
+		dst4->updated = jiffies;
+		dst4->dev = dev;
+		INIT_WORK(&dst4->work, sume_router_dst4_add_work);
+		queue_work(sume_router.wq, &dst4->work);
+
+	}
+end:
+	sume_router_unlock();
+
 	return 0;
 }
 
@@ -1396,19 +1538,19 @@ static int sume_router_obj_fib4_add(struct net_device *dev,
 		/* XXX:
 		 * This is connected route. how to handle it ?
 		 */
-		pr_info("%s: %pI4, %pI4 is connected route (%d),\n",
+		pr_debug("%s: %pI4, %pI4 is connected route (%d),\n",
 			__func__, &network, &netmask, fib4->fi->fib_scope);
 
 		if (switchdev_trans_ph_prepare(obj))
 			return -EOPNOTSUPP;
 	}
 
-	if (fib->fi->fib_scope == RT_SCOPE_HOST) {
+	if (fib4->fi->fib_scope == RT_SCOPE_HOST) {
 		/* self host route. update dst addr filter of sume. */
 		if (switchdev_trans_ph_prepare(obj))
 			return 0;
-		sume_router_filter_update(dev, entwork, netmask, gateway,
-					  SUME_ROUTER_OP_FLAG_ISNTALL);
+		sume_router_filter_update(dev, network,
+					  SUME_ROUTER_OP_FLAG_INSTALL);
 		return 0;
 	}
 
@@ -1431,6 +1573,13 @@ sume_router_obj_fib4_del(struct net_device *dev, struct switchdev_obj *obj)
 	network = htonl (fib4->dst);
 	netmask = inet_make_mask(fib4->dst_len);
 	gateway = fib4->fi->fib_nh->nh_gw;
+
+	if (fib4->fi->fib_scope == RT_SCOPE_HOST) {
+		/* self host route. update dst addr filter of sume. */
+		sume_router_filter_update(dev, network,
+					  SUME_ROUTER_OP_FLAG_INSTALL);
+		return 0;
+	}
 
 	sume_router_fib4_update(dev, network, netmask, gateway,
 				SUME_ROUTER_OP_FLAG_REMOVE);
@@ -1614,9 +1763,6 @@ sume_netdev_alloc(struct sume_adapter *adapter, unsigned int port)
 
 	/* Keep it off until we registered it. */
 	netif_carrier_off(netdev);
-
-	/* set hardware MAC address of this port for reference_router */
-	sume_router_set_port_mac(netdev);
 
 	return (0);
 }
